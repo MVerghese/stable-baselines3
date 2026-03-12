@@ -109,7 +109,7 @@ def test_make_atari_env(
     new_obs, reward, _, _ = venv.step([venv.action_space.sample() for _ in range(n_envs)])
 
     new_frame_numbers = [env.unwrapped.ale.getEpisodeFrameNumber() for env in venv.envs]
-    for frame_number, new_frame_number in zip(frame_numbers, new_frame_numbers):
+    for frame_number, new_frame_number in zip(frame_numbers, new_frame_numbers, strict=True):
         assert new_frame_number - frame_number == frame_skip
     assert new_obs.shape == expected_shape
     if clip_reward:
@@ -340,15 +340,13 @@ def test_evaluate_policy_monitors(vec_env_class):
     # Test that we also track correct episode dones, not the wrapped ones.
     # Sanity check that we get only one step per episode.
     eval_env = make_eval_env(with_monitor=False, wrapper_class=AlwaysDoneWrapper)
-    episode_rewards, episode_lengths = evaluate_policy(
-        model, eval_env, n_eval_episodes, return_episode_rewards=True, warn=False
-    )
+    _, episode_lengths = evaluate_policy(model, eval_env, n_eval_episodes, return_episode_rewards=True, warn=False)
     assert all(map(lambda length: length == 1, episode_lengths)), "AlwaysDoneWrapper did not fix episode lengths to one"
     eval_env.close()
 
     # Should get longer episodes with with Monitor (true episodes)
     eval_env = make_eval_env(with_monitor=True, wrapper_class=AlwaysDoneWrapper)
-    episode_rewards, episode_lengths = evaluate_policy(model, eval_env, n_eval_episodes, return_episode_rewards=True)
+    _, episode_lengths = evaluate_policy(model, eval_env, n_eval_episodes, return_episode_rewards=True)
     assert all(map(lambda length: length > 1, episode_lengths)), "evaluate_policy did not get episode lengths from Monitor"
     eval_env.close()
 
@@ -408,7 +406,7 @@ def test_polyak():
     tau = 0.1
     polyak_update([param1], [param2], tau)
     with th.no_grad():
-        for param, target_param in zip([target1], [target2]):
+        for param, target_param in zip([target1], [target2], strict=True):
             target_param.data.copy_(tau * param.data + (1 - tau) * target_param.data)
 
     assert th.allclose(param1, target1)
@@ -420,7 +418,7 @@ def test_zip_strict():
     list_a = [0, 1]
     list_b = [1, 2, 3]
     # zip does not raise any error
-    for _, _ in zip(list_a, list_b):
+    for _, _ in zip(list_a, list_b, strict=False):
         pass
 
     # zip_strict does raise an error

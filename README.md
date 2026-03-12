@@ -103,7 +103,7 @@ It provides a minimal number of features compared to SB3 but can be much faster 
 **Note:** Stable-Baselines3 supports PyTorch >= 2.3
 
 ### Prerequisites
-Stable Baselines3 requires Python 3.9+.
+Stable Baselines3 requires Python 3.10+.
 
 #### Windows
 
@@ -210,7 +210,7 @@ Actions `gymnasium.spaces`:
 ## Testing the installation
 ### Install dependencies
 ```sh
-pip install -e .[docs,tests,extra]
+pip install -e '.[docs,tests,extra]'
 ```
 ### Run tests
 All unit tests in stable baselines3 can be run using `pytest` runner:
