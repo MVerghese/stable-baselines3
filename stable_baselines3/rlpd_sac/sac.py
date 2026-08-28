@@ -159,6 +159,27 @@ class RLPD_SAC(OffPolicyAlgorithm):
     :param device: Device (cpu, cuda, ...) on which the code should be run.
         Setting it to auto, the code will be run on the GPU if possible.
     :param _init_setup_model: Whether or not to build the network at the creation of the instance
+    :param redq_subset_size: REDQ — when n_critics > 2, the TD target is the min over
+        a random subset of M = ``redq_subset_size`` critics out of N = ``n_critics``,
+        and the actor is updated against the MEAN over all N critics (REDQ recipe).
+        When ``redq_subset_size >= n_critics`` (or None), REDQ is disabled and the
+        target/actor both use the min over all critics (standard SAC behaviour).
+        Default 2.
+    :param residual_reg_coef: If > 0, adds ``residual_reg_coef * mean(||actions_pi||^2)``
+        to the actor loss, where ``actions_pi`` is the (squashed) policy output. In a
+        residual-RL setup where the env applies ``alpha * actions_pi + base_action``,
+        this penalises the RL residual magnitude — directly bounding OOD action
+        proposals from the actor. Default 0.0 (disabled).
+    :param offline_ratio_final: If set, ``offline_ratio`` is linearly annealed from its
+        initial value (passed in as ``offline_ratio``) to ``offline_ratio_final`` over
+        training, tracked via ``self._current_progress_remaining``. Useful when the
+        actor learns to deviate from the offline-data action distribution over time
+        (e.g. residual RL with a=0 offline data). Default None (constant).
+    :param offline_ratio_anneal_frac: Fraction of training over which the anneal
+        completes; only used when ``offline_ratio_final is not None``. Default 1.0
+        anneals over the full run. Set to e.g. 0.5 to finish the anneal at the
+        midpoint of training and hold at ``offline_ratio_final`` for the second
+        half. Clamped to ``(0, 1]``.
     """
 
     policy_aliases: ClassVar[dict[str, type[BasePolicy]]] = {
@@ -203,6 +224,13 @@ class RLPD_SAC(OffPolicyAlgorithm):
         _init_setup_model: bool = True,
         offline_ratio: float = 0.0,
         offline_buffer_path: Optional[str] = None,
+        redq_subset_size: Optional[int] = 2,
+        residual_reg_coef: float = 0.0,
+        offline_ratio_final: Optional[float] = None,
+        offline_ratio_anneal_frac: float = 1.0,
+        train_critic_with_entropy: bool = True,
+        num_critic_updates_per_actor_update: int = 1,
+        actor_use_min_q: bool = False,
     ):
         super().__init__(
             policy,
@@ -243,6 +271,38 @@ class RLPD_SAC(OffPolicyAlgorithm):
         print("Offline Ratio during initialization:", offline_ratio)
         self.offline_ratio = offline_ratio
         self.offline_buffer_path = offline_buffer_path
+        # REDQ / actor-residual-reg / offline-ratio-annealing knobs (no-op by default
+        # unless n_critics > redq_subset_size, residual_reg_coef > 0, or
+        # offline_ratio_final is not None).
+        self.redq_subset_size = redq_subset_size
+        self.residual_reg_coef = float(residual_reg_coef)
+        self.offline_ratio_final = offline_ratio_final
+        # Clamp anneal frac to (0, 1]; values outside that are nonsensical.
+        self.offline_ratio_anneal_frac = float(min(max(offline_ratio_anneal_frac, 1e-9), 1.0))
+        # DSRL: in the high-dim latent action space (512-d) the SAC entropy term
+        # -alpha*log_prob in the TD target is huge and noisy, inflating Q targets
+        # (Q-overestimation). Set False to keep entropy in the actor loss only
+        # (matches the robometer DSRL reference: train_critic_with_entropy=False).
+        self.train_critic_with_entropy = bool(train_critic_with_entropy)
+        # DSRL step-3 actor-side recipe (robometer reference). Delayed actor:
+        # run G critic updates per actor/alpha update so the actor follows a
+        # sharper Q. actor_use_min_q: actor takes the MIN over the full critic
+        # ensemble (pessimistic) instead of the REDQ mean, which is what pushes
+        # it to find genuinely-better latents rather than coasting on mean-Q.
+        self.num_critic_updates_per_actor_update = max(int(num_critic_updates_per_actor_update), 1)
+        self.actor_use_min_q = bool(actor_use_min_q)
+        print(f"REDQ subset_size: {self.redq_subset_size} (active only if n_critics > subset_size)")
+        if not self.train_critic_with_entropy:
+            print("Critic TD target: entropy term DISABLED (train_critic_with_entropy=False)")
+        if self.num_critic_updates_per_actor_update > 1:
+            print(f"Delayed actor: {self.num_critic_updates_per_actor_update} critic updates per actor/alpha update")
+        if self.actor_use_min_q:
+            print("Actor loss: MIN over full critic ensemble (actor_use_min_q=True)")
+        if self.residual_reg_coef > 0:
+            print(f"Residual reg coef: {self.residual_reg_coef}")
+        if self.offline_ratio_final is not None:
+            print(f"Offline ratio anneal: {self.offline_ratio} -> {self.offline_ratio_final} "
+                  f"over first {self.offline_ratio_anneal_frac * 100:.0f}% of training")
 
         if _init_setup_model:
             self._setup_model()
@@ -286,7 +346,10 @@ class RLPD_SAC(OffPolicyAlgorithm):
         print("Offline buffer path:", self.offline_buffer_path)
         print("device:", self.device)
         print("env:", self.env)
-        self.offline_buffer = load_offline_buffer(self.offline_buffer_path, self.device, self.env) if self.offline_ratio > 0 else None
+        # Load the offline buffer if it could be used at any point during training,
+        # i.e. either the initial offline_ratio > 0 or the annealed final > 0.
+        _needs_offline = self.offline_ratio > 0 or (self.offline_ratio_final is not None and self.offline_ratio_final > 0)
+        self.offline_buffer = load_offline_buffer(self.offline_buffer_path, self.device, self.env) if _needs_offline else None
 
     def _create_aliases(self) -> None:
         self.actor = self.policy.actor
@@ -306,102 +369,157 @@ class RLPD_SAC(OffPolicyAlgorithm):
 
         ent_coef_losses, ent_coefs = [], []
         actor_losses, critic_losses = [], []
+        residual_penalties = []  # only populated if residual_reg_coef > 0
+        qf_pi_means = []         # mean Q used in actor loss (logging)
 
-        with tqdm(range(gradient_steps), desc='Batch') as tqdm_steps:
-            for gradient_step in tqdm_steps:
-                # Sample replay buffer
-                if self.offline_ratio > 0:
-                    if self.replay_buffer.pos == 0:
-                        # This handles the case where pretraining is performed on the offline buffer before any samples are collected online
-                        replay_data = self.offline_buffer.sample(batch_size, env=self._vec_normalize_env)
-                    else:
-                        replay_data = self.replay_buffer.sample(int(batch_size * (1 - self.offline_ratio)), env=self._vec_normalize_env)  # type: ignore[union-attr]
-                        offline_data = self.offline_buffer.sample(int(batch_size * self.offline_ratio), env=self._vec_normalize_env)  # type: ignore[union-attr]
-                        replay_data = merge_buffer_samples(replay_data, offline_data)
-                    # For n-step replay, discount factor is gamma**n_steps (when no early termination)
+        # Linearly anneal offline_ratio if offline_ratio_final is set. progress
+        # goes 0 -> 1 over training. Dividing by offline_ratio_anneal_frac lets
+        # the anneal complete earlier (e.g. frac=0.5 → done at the midpoint,
+        # held at offline_ratio_final for the rest of the run).
+        if self.offline_ratio_final is not None:
+            progress = 1.0 - float(getattr(self, "_current_progress_remaining", 1.0))
+            progress = min(max(progress, 0.0), 1.0)
+            anneal_progress = min(progress / self.offline_ratio_anneal_frac, 1.0)
+            current_offline_ratio = self.offline_ratio + (self.offline_ratio_final - self.offline_ratio) * anneal_progress
+        else:
+            current_offline_ratio = self.offline_ratio
+
+        # with tqdm(range(gradient_steps), desc='Batch') as tqdm_steps:
+        for gradient_step in range(gradient_steps):
+            # Sample replay buffer
+            if current_offline_ratio > 0:
+                if self.replay_buffer.pos == 0:
+                    # This handles the case where pretraining is performed on the offline buffer before any samples are collected online
+                    replay_data = self.offline_buffer.sample(batch_size, env=self._vec_normalize_env)
                 else:
-                    replay_data = self.replay_buffer.sample(batch_size, env=self._vec_normalize_env)  # type: ignore[union-attr]
-                discounts = replay_data.discounts if replay_data.discounts is not None else self.gamma
+                    replay_data = self.replay_buffer.sample(int(batch_size * (1 - current_offline_ratio)), env=self._vec_normalize_env)  # type: ignore[union-attr]
+                    offline_data = self.offline_buffer.sample(int(batch_size * current_offline_ratio), env=self._vec_normalize_env)  # type: ignore[union-attr]
+                    replay_data = merge_buffer_samples(replay_data, offline_data)
+                # For n-step replay, discount factor is gamma**n_steps (when no early termination)
+            else:
+                replay_data = self.replay_buffer.sample(batch_size, env=self._vec_normalize_env)  # type: ignore[union-attr]
+            discounts = replay_data.discounts if replay_data.discounts is not None else self.gamma
 
-                # We need to sample because `log_std` may have changed between two gradient steps
-                if self.use_sde:
-                    self.actor.reset_noise()
+            # Delayed actor: only update the actor (and entropy coef) every
+            # num_critic_updates_per_actor_update gradient steps; the critic
+            # updates every step.
+            do_actor_update = ((gradient_step + 1) % self.num_critic_updates_per_actor_update == 0)
 
-                # Action by the current actor for the sampled state
-                actions_pi, log_prob = self.actor.action_log_prob(replay_data.observations)
-                log_prob = log_prob.reshape(-1, 1)
+            # We need to sample because `log_std` may have changed between two gradient steps
+            if self.use_sde:
+                self.actor.reset_noise()
 
-                ent_coef_loss = None
-                if self.ent_coef_optimizer is not None and self.log_ent_coef is not None:
-                    # Important: detach the variable from the graph
-                    # so we don't change it with other losses
-                    # see https://github.com/rail-berkeley/softlearning/issues/60
-                    ent_coef = th.exp(self.log_ent_coef.detach())
-                    assert isinstance(self.target_entropy, float)
-                    ent_coef_loss = -(self.log_ent_coef * (log_prob + self.target_entropy).detach()).mean()
-                    ent_coef_losses.append(ent_coef_loss.item())
-                else:
-                    ent_coef = self.ent_coef_tensor
+            # Action by the current actor for the sampled state
+            actions_pi, log_prob = self.actor.action_log_prob(replay_data.observations)
+            log_prob = log_prob.reshape(-1, 1)
 
-                ent_coefs.append(ent_coef.item())
+            ent_coef_loss = None
+            if self.ent_coef_optimizer is not None and self.log_ent_coef is not None:
+                # Important: detach the variable from the graph
+                # so we don't change it with other losses
+                # see https://github.com/rail-berkeley/softlearning/issues/60
+                ent_coef = th.exp(self.log_ent_coef.detach())
+                assert isinstance(self.target_entropy, float)
+                ent_coef_loss = -(self.log_ent_coef * (log_prob + self.target_entropy).detach()).mean()
+                ent_coef_losses.append(ent_coef_loss.item())
+            else:
+                ent_coef = self.ent_coef_tensor
 
-                # Optimize entropy coefficient, also called
-                # entropy temperature or alpha in the paper
-                if ent_coef_loss is not None and self.ent_coef_optimizer is not None:
-                    self.ent_coef_optimizer.zero_grad()
-                    ent_coef_loss.backward()
-                    self.ent_coef_optimizer.step()
+            ent_coefs.append(ent_coef.item())
 
-                with th.no_grad():
-                    # Select action according to policy
-                    next_actions, next_log_prob = self.actor.action_log_prob(replay_data.next_observations)
-                    # if gradient_step % 100 == 0:
-                    #     print(f"Gradient Step: {gradient_step}, Action Magnitude: {th.norm(next_actions[:,:3], dim=-1).mean().item()}")
-                    # Compute the next Q values: min over all critics targets
-                    next_q_values = th.cat(self.critic_target(replay_data.next_observations, next_actions), dim=1)
-                    next_q_values, _ = th.min(next_q_values, dim=1, keepdim=True)
-                    # add entropy term
+            # Optimize entropy coefficient, also called
+            # entropy temperature or alpha in the paper. Delayed with the actor.
+            if do_actor_update and ent_coef_loss is not None and self.ent_coef_optimizer is not None:
+                self.ent_coef_optimizer.zero_grad()
+                ent_coef_loss.backward()
+                self.ent_coef_optimizer.step()
+
+            with th.no_grad():
+                # Select action according to policy
+                next_actions, next_log_prob = self.actor.action_log_prob(replay_data.next_observations)
+                # Compute the next Q values across all N critic targets, shape (B, N)
+                next_q_values = th.cat(self.critic_target(replay_data.next_observations, next_actions), dim=1)
+                # REDQ: take the min over a random M-subset of the N critics, randomly
+                # re-sampled each gradient step. When subset_size >= N (or None), falls
+                # back to the standard SAC clipped-double-Q target.
+                n_critics_runtime = next_q_values.shape[1]
+                M = self.redq_subset_size if self.redq_subset_size is not None else n_critics_runtime
+                if M < n_critics_runtime:
+                    idx = th.randperm(n_critics_runtime, device=next_q_values.device)[:M]
+                    next_q_values = next_q_values[:, idx]
+                next_q_values, _ = th.min(next_q_values, dim=1, keepdim=True)
+                # add entropy term (disabled for DSRL: keeps entropy in the actor
+                # loss only, avoiding a huge/noisy bootstrap in the 512-d latent space)
+                if self.train_critic_with_entropy:
                     next_q_values = next_q_values - ent_coef * next_log_prob.reshape(-1, 1)
-                    # td error + entropy term
-                    target_q_values = replay_data.rewards + (1 - replay_data.dones) * discounts * next_q_values
-
-                # Get current Q-values estimates for each critic network
-                # using action from the replay buffer
-                current_q_values = self.critic(replay_data.observations, replay_data.actions)
-
-                # Compute critic loss
-                critic_loss = 0.5 * sum(F.mse_loss(current_q, target_q_values) for current_q in current_q_values)
-                assert isinstance(critic_loss, th.Tensor)  # for type checker
-                critic_losses.append(critic_loss.item())  # type: ignore[union-attr]
-
-                # Optimize the critic
-                self.critic.optimizer.zero_grad()
-                critic_loss.backward()
-                self.critic.optimizer.step()
+                # td error + entropy term
+                target_q_values = replay_data.rewards + (1 - replay_data.dones) * discounts * next_q_values
+            rewards_np = replay_data.rewards.detach().cpu().numpy().flatten()
+            dones_np = replay_data.dones.detach().cpu().numpy().flatten()
+            zero_mask = rewards_np == 0.0
+            if zero_mask.any():
+                n_done = int(dones_np[zero_mask].sum())
+                rb = self.replay_buffer
+                print(f"[zero-reward batch] n_zero={zero_mask.sum()}/{len(rewards_np)} "
+                    f"n_done_among_zero={n_done} "
+                    f"labeled_pos={getattr(rb, 'labeled_pos', None)} pos={rb.pos}")
 
 
-                # Compute actor loss
-                # Alternative: actor_loss = th.mean(log_prob - qf1_pi)
-                # Min over all critic networks
-                q_values_pi = th.cat(self.critic(replay_data.observations, actions_pi), dim=1)
-                min_qf_pi, _ = th.min(q_values_pi, dim=1, keepdim=True)
-                actor_loss = (ent_coef * log_prob - min_qf_pi).mean()
-                actor_losses.append(actor_loss.item())
+            # Get current Q-values estimates for each critic network
+            # using action from the replay buffer
+            current_q_values = self.critic(replay_data.observations, replay_data.actions)
 
-                # Optimize the actor
-                if not only_critic:
-                    self.actor.optimizer.zero_grad()
-                    actor_loss.backward()
-                    self.actor.optimizer.step()
+            # Compute critic loss
+            critic_loss = 0.5 * sum(F.mse_loss(current_q, target_q_values) for current_q in current_q_values)
+            assert isinstance(critic_loss, th.Tensor)  # for type checker
+            critic_losses.append(critic_loss.item())  # type: ignore[union-attr]
 
-                tqdm_steps.set_postfix(critic_loss=critic_loss.item(), actor_loss=actor_loss.item())
+            # Optimize the critic
+            self.critic.optimizer.zero_grad()
+            critic_loss.backward()
+            self.critic.optimizer.step()
 
 
-                # Update target networks
-                if gradient_step % self.target_update_interval == 0:
-                    polyak_update(self.critic.parameters(), self.critic_target.parameters(), self.tau)
-                    # Copy running stats, see GH issue #996
-                    polyak_update(self.batch_norm_stats, self.batch_norm_stats_target, 1.0)
+            # Compute actor loss
+            # Alternative: actor_loss = th.mean(log_prob - qf1_pi)
+            # REDQ recipe: when REDQ is active (M < N), the actor uses the MEAN over
+            # ALL N critics (Chen et al. 2021); the target's random-min already
+            # provides the pessimism. When REDQ is disabled, fall back to SAC's min.
+            q_values_pi = th.cat(self.critic(replay_data.observations, actions_pi), dim=1)
+            if self.actor_use_min_q:
+                # Pessimistic actor: min over the FULL ensemble (DSRL step-3).
+                qf_pi, _ = th.min(q_values_pi, dim=1, keepdim=True)
+            elif self.redq_subset_size is not None and self.redq_subset_size < q_values_pi.shape[1]:
+                qf_pi = q_values_pi.mean(dim=1, keepdim=True)
+            else:
+                qf_pi, _ = th.min(q_values_pi, dim=1, keepdim=True)
+            actor_loss = (ent_coef * log_prob - qf_pi).mean()
+
+            # Residual / behavioural regulariser: penalises the magnitude of the
+            # (squashed) RL action, which IS the residual after BasePolicyWrapper
+            # scales it by alpha. Caps OOD action proposals at the source.
+            if self.residual_reg_coef > 0:
+                residual_penalty = self.residual_reg_coef * actions_pi.pow(2).sum(dim=-1).mean()
+                actor_loss = actor_loss + residual_penalty
+                residual_penalties.append(residual_penalty.item())
+
+            actor_losses.append(actor_loss.item())
+            qf_pi_means.append(qf_pi.mean().item())
+
+            # Optimize the actor (delayed: only every num_critic_updates_per_actor_update steps)
+            if not only_critic and do_actor_update:
+                self.actor.optimizer.zero_grad()
+                actor_loss.backward()
+                self.actor.optimizer.step()
+
+            # tqdm_steps.set_postfix(critic_loss=critic_loss.item(), actor_loss=actor_loss.item())
+
+
+            # Update target networks
+            if gradient_step % self.target_update_interval == 0:
+                polyak_update(self.critic.parameters(), self.critic_target.parameters(), self.tau)
+                # Copy running stats, see GH issue #996
+                polyak_update(self.batch_norm_stats, self.batch_norm_stats_target, 1.0)
 
         self._n_updates += gradient_steps
 
@@ -409,6 +527,13 @@ class RLPD_SAC(OffPolicyAlgorithm):
         self.logger.record("train/ent_coef", np.mean(ent_coefs))
         self.logger.record("train/actor_loss", np.mean(actor_losses))
         self.logger.record("train/critic_loss", np.mean(critic_losses))
+        # Current offline ratio (visible whenever offline_ratio_final is set, or just
+        # a constant otherwise — useful as a sanity check that annealing is applied).
+        self.logger.record("train/offline_ratio", float(current_offline_ratio))
+        if len(qf_pi_means) > 0:
+            self.logger.record("train/qf_pi_mean", float(np.mean(qf_pi_means)))
+        if self.residual_reg_coef > 0 and len(residual_penalties) > 0:
+            self.logger.record("train/residual_penalty", float(np.mean(residual_penalties)))
         if len(ent_coef_losses) > 0:
             self.logger.record("train/ent_coef_loss", np.mean(ent_coef_losses))
 
